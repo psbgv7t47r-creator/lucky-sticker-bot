@@ -33,7 +33,8 @@ GAMES = {
     "basketball": ("🏀", "Баскетбол"),
     "bowling": ("🎳", "Боулинг"),
     "dice": ("🎲", "Кубики"),
-    "darts": ("🎯", "Дартс")
+    "darts": ("🎯", "Дартс"),
+    "slot": ("🎰", "Слот")
 }
 
 TIERS = [1, 3, 5, 10, 100]
@@ -45,10 +46,17 @@ def main_menu():
     ])
 
 
+def slot_points(value):
+    # Предварительная оценка:
+    # Telegram slot value пока не позволяет
+    # надёжно определить комбинацию по догадке.
+    return None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⭐ Добро пожаловать в Lucky Sticker!\n\n"
-        "Выбирай количество игр и начинай!",
+        "Выбирай количество игр!",
         reply_markup=main_menu()
     )
 
@@ -79,7 +87,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "home":
         await query.edit_message_text(
-            "⭐ Lucky Sticker\n\nГлавное меню:",
+            "⭐ Lucky Sticker",
             reply_markup=main_menu()
         )
 
@@ -108,7 +116,6 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = query.from_user.id
 
         if user_id in active_users:
-            await query.answer("Дождись окончания текущей серии!")
             return
 
         game = data.split(":")[1]
@@ -123,7 +130,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text(
             f"🎮 Игра: {name}\n"
-            f"Количество попыток: {rounds}\n\n"
+            f"Количество игр: {rounds}\n\n"
             "Начинаем!"
         )
 
@@ -134,12 +141,15 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 rounds,
                 emoji,
                 name,
+                game,
                 user_id
             )
         )
 
 
-async def play_games(bot, chat_id, rounds, emoji, name, user_id):
+async def play_games(
+    bot, chat_id, rounds, emoji, name, game, user_id
+):
     total_points = 0
 
     try:
@@ -149,10 +159,27 @@ async def play_games(bot, chat_id, rounds, emoji, name, user_id):
                 emoji=emoji
             )
 
-            points = result.dice.value
-            total_points += points
+            value = result.dice.value
 
             await asyncio.sleep(2)
+
+            if game == "slot":
+                points = slot_points(value)
+
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🎰 Результат слота №{i + 1}\n"
+                        f"Технический результат: {value}\n"
+                        "Комбинацию пока проверяем.\n"
+                        "Очки не начислены."
+                    )
+                )
+
+                continue
+
+            points = value
+            total_points += points
 
             await bot.send_message(
                 chat_id=chat_id,
@@ -166,20 +193,27 @@ async def play_games(bot, chat_id, rounds, emoji, name, user_id):
             if i < rounds - 1:
                 await asyncio.sleep(1)
 
-        await bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "✅ Серия завершена!\n\n"
-                f"🎮 Игр сыграно: {rounds}\n"
-                f"⭐ Всего очков: {total_points}\n"
-                f"📊 Среднее количество очков: "
-                f"{total_points / rounds:.2f}"
-            ),
-            reply_markup=main_menu()
-        )
+        if game != "slot":
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "✅ Серия завершена!\n\n"
+                    f"🎮 Игр сыграно: {rounds}\n"
+                    f"⭐ Всего очков: {total_points}\n"
+                    f"📊 Среднее: {total_points / rounds:.2f}"
+                ),
+                reply_markup=main_menu()
+            )
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="Проверка слота завершена.",
+                reply_markup=main_menu()
+            )
 
     except Exception as error:
         print(f"Game error: {error}")
+
         await bot.send_message(
             chat_id=chat_id,
             text="Произошла ошибка во время игры."
@@ -251,3 +285,4 @@ if __name__ == "__main__":
         raise RuntimeError("Bot startup timeout")
 
     serve(app, host="0.0.0.0", port=PORT)
+
