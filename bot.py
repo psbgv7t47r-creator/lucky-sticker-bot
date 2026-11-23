@@ -109,21 +109,29 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        rounds, emoji, user_id)
         )
 
-
 async def play_games(bot, chat_id, rounds, emoji, user_id):
     try:
         for i in range(rounds):
-            await bot.send_dice(
+            result = await bot.send_dice(
                 chat_id=chat_id,
                 emoji=emoji
             )
 
+            points = result.dice.value
+
+            await asyncio.sleep(2)
+
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"🎯 Результат броска №{i + 1}: {points}"
+            )
+
             if i < rounds - 1:
-                await asyncio.sleep(1.1)
+                await asyncio.sleep(1)
 
         await bot.send_message(
             chat_id=chat_id,
-            text=f"✅ Готово! Проведено игр: {rounds}"
+            text=f"✅ Все готово! Проведено игр: {rounds}"
         )
 
     finally:
