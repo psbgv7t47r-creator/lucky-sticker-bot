@@ -1,288 +1,526 @@
 
-import os
-import asyncio
-import threading
 
-from flask import Flask, request
-from waitress import serve
+import os
+import sqlite3
+import asyncio
+import logging
+from datetime import date
+from collections import Counter
 
 from telegram import (
     Update,
     InlineKeyboardButton,
-    InlineKeyboardMarkup
+    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
-    ContextTypes
+    ContextTypes,
 )
 
+# ==============================
+# НАСТРОЙКИ
+# ==============================
+
 TOKEN = os.getenv("BOT_TOKEN")
-URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-PORT = int(os.getenv("PORT", 10000))
+DB_NAME = "lucky_sticker.db"
 
-app = Flask(__name__)
-application = Application.builder().token(TOKEN).build()
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 
-loop = None
-ready = threading.Event()
-active_users = set()
+# ==============================
+# БАЗА ДАННЫХ
+# ==============================
 
-GAMES = {
-    "basketball": ("🏀", "Баскетбол"),
-    "bowling": ("🎳", "Боулинг"),
-    "dice": ("🎲", "Кубики"),
-    "darts": ("🎯", "Дартс"),
-    "slot": ("🎰", "Слот")
-}
+def init_db():
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                name TEXT,
+                coins INTEGER DEFAULT 0,
+                bonus_date TEXT DEFAULT ''
+            )
+        """)
+        db.commit()
 
-TIERS = [1, 3, 5, 10, 100]
+
+def update_user(user):
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute("""
+            INSERT INTO users (user_id, name)
+            VALUES (?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET name = excluded.name
+        """, (user.id, user.first_name or "Игрок"))
+        db.commit()
 
 
-def main_menu():
+def get_user(user_id):
+    with sqlite3.connect(DB_NAME) as db:
+        return db.execute(
+            "SELECT coins, bonus_date FROM users WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+
+
+def add_coins(user_id, amount):
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute(
+            "UPDATE users SET coins = coins + ? WHERE user_id = ?",
+            (amount, user_id)
+        )
+        db.commit()
+
+
+# ==============================
+# ТАБЛИЦА 64 КОМБИНАЦИЙ
+# ==============================
+
+SYMBOLS = ["BAR", "🍇", "🍋", "7"]
+
+SLOT_POINTS = [
+    40, 2, 2, 2, 2, 2, 1, 1,
+    2, 1, 2, 1, 2, 1, 1, 2,
+    2, 2, 1, 1, 2, 15, 2, 2,
+    1, 2, 2, 1, 1, 2, 1, 2,
+    2, 1, 2, 1, 1, 2, 2, 1,
+    2, 2, 15, 2, 1, 1, 2, 2,
+    2, 1, 1, 2, 1, 2, 1, 2,
+    1, 1, 2, 2, 2, 2, 2, 100
+]
+
+SLOT_COMBINATIONS = {}
+
+number = 1
+
+for third in SYMBOLS:
+    for second in SYMBOLS:
+        for first in SYMBOLS:
+            SLOT_COMBINATIONS[number] = {
+                "combination": (first, second, third),
+                "points": SLOT_POINTS[number - 1]
+            }
+            number += 1
+
+
+# ==============================
+# КЛАВИАТУРЫ
+# ==============================
+
+def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎮 Играть", callback_data="tiers")]
+        [
+            InlineKeyboardButton("🎮 Играть", callback_data="games"),
+        ],
+        [
+            InlineKeyboardButton("🎁 Бонус", callback_data="bonus"),
+            InlineKeyboardButton("👤 Профиль", callback_data="profile"),
+        ],
+        [
+            InlineKeyboardButton("🏆 Рейтинг", callback_data="top"),
+        ],
     ])
 
 
-def slot_points(value):
-    # Предварительная оценка:
-    # Telegram slot value пока не позволяет
-    # надёжно определить комбинацию по догадке.
-    return None
+def games_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏀 Баскетбол", callback_data="game:basketball"),
+            InlineKeyboardButton("🎳 Боулинг", callback_data="game:bowling"),
+        ],
+        [
+            InlineKeyboardButton("🎲 Кубик", callback_data="game:dice"),
+            InlineKeyboardButton("🎯 Дартс", callback_data="game:darts"),
+        ],
+        [
+            InlineKeyboardButton("🎰 Слоты", callback_data="game:slots"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Назад", callback_data="menu"),
+        ]
+    ])
 
+
+def count_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("1 запуск", callback_data="count:1"),
+            InlineKeyboardButton("3 запуска", callback_data="count:3"),
+        ],
+        [
+            InlineKeyboardButton("5 запусков", callback_data="count:5"),
+            InlineKeyboardButton("10 запусков", callback_data="count:10"),
+        ],
+        [
+            InlineKeyboardButton("100 запусков", callback_data="count:100"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Назад", callback_data="games"),
+        ]
+    ])
+
+
+# ==============================
+# КОМАНДА START
+# ==============================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    update_user(user)
+
     await update.message.reply_text(
-        "⭐ Добро пожаловать в Lucky Sticker!\n\n"
-        "Выбирай количество игр!",
-        reply_markup=main_menu()
+        f"👋 Добро пожаловать, {user.first_name}!\n\n"
+        "🎮 Добро пожаловать в Lucky Sticker!\n\n"
+        "Здесь тебя ждут игры, бонусы и рейтинг игроков.\n\n"
+        "🎁 Ежедневный бонус: +50 очков\n"
+        "♾️ Бесплатные игровые попытки\n\n"
+        "Выбирай действие:",
+        reply_markup=main_keyboard()
     )
 
 
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ==============================
+# ИГРЫ
+# ==============================
+
+GAME_NAMES = {
+    "basketball": ("🏀 Баскетбол", "🏀"),
+    "bowling": ("🎳 Боулинг", "🎳"),
+    "dice": ("🎲 Кубик", "🎲"),
+    "darts": ("🎯 Дартс", "🎯"),
+    "slots": ("🎰 Слоты", "🎰"),
+}
+
+
+async def play_game(update, context, game, count):
     query = update.callback_query
-    await query.answer()
+    user_id = query.from_user.id
 
-    data = query.data
+    if context.user_data.get("playing"):
+        await query.message.reply_text("⏳ Твоя игра уже выполняется.")
+        return
 
-    if data == "tiers":
-        keyboard = [
-            [InlineKeyboardButton(
-                f"🎮 {n} игр",
-                callback_data=f"tier:{n}"
-            )]
-            for n in TIERS
-        ]
+    context.user_data["playing"] = True
 
-        keyboard.append([
-            InlineKeyboardButton("⬅️ Главное меню", callback_data="home")
-        ])
+    emoji = GAME_NAMES[game][1]
 
-        await query.edit_message_text(
-            "Выбери количество игр:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    elif data == "home":
-        await query.edit_message_text(
-            "⭐ Lucky Sticker",
-            reply_markup=main_menu()
-        )
-
-    elif data.startswith("tier:"):
-        rounds = int(data.split(":")[1])
-        context.user_data["rounds"] = rounds
-
-        keyboard = [
-            [InlineKeyboardButton(
-                f"{emoji} {name}",
-                callback_data=f"game:{key}"
-            )]
-            for key, (emoji, name) in GAMES.items()
-        ]
-
-        keyboard.append([
-            InlineKeyboardButton("⬅️ Назад", callback_data="tiers")
-        ])
-
-        await query.edit_message_text(
-            f"Выбрано игр: {rounds}\n\nВыбери игру:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-
-    elif data.startswith("game:"):
-        user_id = query.from_user.id
-
-        if user_id in active_users:
-            return
-
-        game = data.split(":")[1]
-
-        if game not in GAMES:
-            return
-
-        rounds = context.user_data.get("rounds", 1)
-        emoji, name = GAMES[game]
-
-        active_users.add(user_id)
-
-        await query.edit_message_text(
-            f"🎮 Игра: {name}\n"
-            f"Количество игр: {rounds}\n\n"
-            "Начинаем!"
-        )
-
-        context.application.create_task(
-            play_games(
-                context.bot,
-                query.message.chat_id,
-                rounds,
-                emoji,
-                name,
-                game,
-                user_id
-            )
-        )
-
-
-async def play_games(
-    bot, chat_id, rounds, emoji, name, game, user_id
-):
     total_points = 0
+    results = Counter()
+    slot_details = Counter()
+
+    await query.message.reply_text(
+        f"🎮 Начинаем игру!\n"
+        f"Игра: {GAME_NAMES[game][0]}\n"
+        f"Количество запусков: {count}\n\n"
+        "Следи за результатами!"
+    )
 
     try:
-        for i in range(rounds):
-            result = await bot.send_dice(
-                chat_id=chat_id,
+        for i in range(count):
+            result_message = await context.bot.send_dice(
+                chat_id=query.message.chat_id,
                 emoji=emoji
             )
 
-            value = result.dice.value
+            value = result_message.dice.value
 
-            await asyncio.sleep(2)
+            if game == "slots":
+                slot = SLOT_COMBINATIONS[value]
+                combination = slot["combination"]
+                points = slot["points"]
 
-            if game == "slot":
-                points = slot_points(value)
+                combination_text = " – ".join(combination)
 
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        f"🎰 Результат слота №{i + 1}\n"
-                        f"Технический результат: {value}\n"
-                        "Комбинацию пока проверяем.\n"
-                        "Очки не начислены."
-                    )
+                total_points += points
+                slot_details[(combination_text, points)] += 1
+
+            else:
+                points = value * 5
+                total_points += points
+                results[value] += 1
+
+            if i < count - 1:
+                await asyncio.sleep(1.1)
+
+        add_coins(user_id, total_points)
+
+        summary = (
+            "🏁 ИГРА ЗАВЕРШЕНА!\n\n"
+            f"🎮 Игра: {GAME_NAMES[game][0]}\n"
+            f"🔢 Запусков: {count}\n"
+            f"⭐ Получено очков: {total_points}\n\n"
+        )
+
+        if game == "slots":
+            summary += "📊 РЕЗУЛЬТАТЫ КОМБИНАЦИЙ:\n"
+
+            for (combination, points), amount in sorted(
+                slot_details.items()
+            ):
+                summary += (
+                    f"\n{combination} — {points} очков"
+                    f" × {amount}"
                 )
-
-                continue
-
-            points = value
-            total_points += points
-
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"{emoji} {name}\n"
-                    f"🎯 Игра №{i + 1}\n"
-                    f"⭐ Выпало очков: {points}"
-                )
-            )
-
-            if i < rounds - 1:
-                await asyncio.sleep(1)
-
-        if game != "slot":
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "✅ Серия завершена!\n\n"
-                    f"🎮 Игр сыграно: {rounds}\n"
-                    f"⭐ Всего очков: {total_points}\n"
-                    f"📊 Среднее: {total_points / rounds:.2f}"
-                ),
-                reply_markup=main_menu()
-            )
         else:
-            await bot.send_message(
-                chat_id=chat_id,
-                text="Проверка слота завершена.",
-                reply_markup=main_menu()
-            )
+            summary += "📊 РЕЗУЛЬТАТЫ:\n"
 
-    except Exception as error:
-        print(f"Game error: {error}")
+            for value, amount in sorted(results.items()):
+                summary += (
+                    f"\nВыпало {value} — {amount} раз"
+                )
 
-        await bot.send_message(
-            chat_id=chat_id,
-            text="Произошла ошибка во время игры."
+        await query.message.reply_text(
+            summary,
+            reply_markup=main_keyboard()
+        )
+
+    except Exception:
+        logging.exception("Ошибка во время игры")
+        await query.message.reply_text(
+            "⚠️ Произошла ошибка во время игры. Попробуй позже.",
+            reply_markup=main_keyboard()
         )
 
     finally:
-        active_users.discard(user_id)
+        context.user_data["playing"] = False
 
 
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CallbackQueryHandler(button))
+# ==============================
+# БОНУС
+# ==============================
 
+async def bonus(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
 
-@app.route("/")
-def home():
-    return "Lucky Sticker is running!"
+    today = date.today().isoformat()
+    data = get_user(user_id)
 
+    if data is None:
+        update_user(query.from_user)
+        data = get_user(user_id)
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    if not application.running:
-        return "Bot is not ready", 503
+    if data[1] == today:
+        await query.message.reply_text(
+            "⏳ Ты уже получил сегодняшний бонус!",
+            reply_markup=main_keyboard()
+        )
+        return
 
-    data = request.get_json(silent=True)
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute("""
+            UPDATE users
+            SET coins = coins + 50, bonus_date = ?
+            WHERE user_id = ?
+        """, (today, user_id))
+        db.commit()
 
-    if not data:
-        return "Invalid update", 400
-
-    update = Update.de_json(data, application.bot)
-
-    future = asyncio.run_coroutine_threadsafe(
-        application.update_queue.put(update),
-        loop
+    await query.message.reply_text(
+        "🎁 БОНУС ПОЛУЧЕН!\n\n"
+        "⭐ Тебе начислено 50 очков!\n"
+        "Возвращайся завтра за новым бонусом.",
+        reply_markup=main_keyboard()
     )
 
-    try:
-        future.result(timeout=10)
-    except Exception:
-        return "Webhook error", 500
 
-    return "OK", 200
+# ==============================
+# ПРОФИЛЬ
+# ==============================
+
+async def profile(update, context):
+    query = update.callback_query
+    user_id = query.from_user.id
+
+    data = get_user(user_id)
+
+    if data is None:
+        update_user(query.from_user)
+        data = get_user(user_id)
+
+    await query.message.reply_text(
+        "👤 ТВОЙ ПРОФИЛЬ\n\n"
+        f"Имя: {query.from_user.first_name}\n"
+        f"ID: {user_id}\n"
+        f"⭐ Баланс: {data[0]} очков",
+        reply_markup=main_keyboard()
+    )
 
 
-def run_bot():
-    global loop
+# ==============================
+# РЕЙТИНГ
+# ==============================
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+async def top(update, context):
+    query = update.callback_query
 
-    async def setup():
-        await application.initialize()
-        await application.start()
-        await application.bot.set_webhook(URL + "/webhook")
+    with sqlite3.connect(DB_NAME) as db:
+        users = db.execute("""
+            SELECT name, coins
+            FROM users
+            ORDER BY coins DESC
+            LIMIT 10
+        """).fetchall()
 
-    loop.run_until_complete(setup())
-    ready.set()
-    loop.run_forever()
+    text = "🏆 ТОП-10 ИГРОКОВ\n\n"
+
+    if not users:
+        text += "Пока игроков нет."
+    else:
+        for i, (name, coins) in enumerate(users, 1):
+            text += f"{i}. {name} — {coins} ⭐\n"
+
+    await query.message.reply_text(
+        text,
+        reply_markup=main_keyboard()
+    )
+
+
+# ==============================
+# ОБРАБОТЧИК КНОПОК
+# ==============================
+
+async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    update_user(user)
+
+    data = query.data
+
+    if data == "menu":
+        await query.message.reply_text(
+            "🏠 Главное меню",
+            reply_markup=main_keyboard()
+        )
+
+    elif data == "games":
+        await query.message.reply_text(
+            "🎮 ВЫБЕРИ ИГРУ:",
+            reply_markup=games_keyboard()
+        )
+
+    elif data.startswith("game:"):
+        game = data.split(":")[1]
+
+        context.user_data["selected_game"] = game
+
+        await query.message.reply_text(
+            f"🎮 Выбрана игра: {GAME_NAMES[game][0]}\n\n"
+            "Выбери количество бесплатных запусков:",
+            reply_markup=count_keyboard()
+        )
+
+    elif data.startswith("count:"):
+        count = int(data.split(":")[1])
+        game = context.user_data.get("selected_game")
+
+        if game not in GAME_NAMES:
+            await query.message.reply_text(
+                "Сначала выбери игру.",
+                reply_markup=games_keyboard()
+            )
+            return
+
+        await play_game(update, context, game, count)
+
+    elif data == "bonus":
+        await bonus(update, context)
+
+    elif data == "profile":
+        await profile(update, context)
+
+    elif data == "top":
+        await top(update, context)
+
+
+# ==============================
+# КОМАНДЫ
+# ==============================
+
+async def games_command(update, context):
+    update_user(update.effective_user)
+
+    await update.message.reply_text(
+        "🎮 ВЫБЕРИ ИГРУ:",
+        reply_markup=games_keyboard()
+    )
+
+
+async def bonus_command(update, context):
+    update_user(update.effective_user)
+
+    class FakeQuery:
+        def __init__(self, message):
+            self.message = message
+            self.from_user = message.from_user
+
+    class FakeUpdate:
+        def __init__(self, message):
+            self.callback_query = FakeQuery(message)
+
+    await bonus(FakeUpdate(update.message), context)
+
+
+async def profile_command(update, context):
+    update_user(update.effective_user)
+
+    class FakeQuery:
+        def __init__(self, message):
+            self.message = message
+            self.from_user = message.from_user
+
+    class FakeUpdate:
+        def __init__(self, message):
+            self.callback_query = FakeQuery(message)
+
+    await profile(FakeUpdate(update.message), context)
+
+
+async def top_command(update, context):
+    class FakeQuery:
+        def __init__(self, message):
+            self.message = message
+
+    class FakeUpdate:
+        def __init__(self, message):
+            self.callback_query = FakeQuery(message)
+
+    await top(FakeUpdate(update.message), context)
+
+
+# ==============================
+# ЗАПУСК
+# ==============================
+
+def main():
+    if not TOKEN:
+        raise RuntimeError(
+            "Не найдена переменная окружения BOT_TOKEN"
+        )
+
+    init_db()
+
+    application = Application.builder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("games", games_command))
+    application.add_handler(CommandHandler("bonus", bonus_command))
+    application.add_handler(CommandHandler("profile", profile_command))
+    application.add_handler(CommandHandler("top", top_command))
+
+    application.add_handler(
+        CallbackQueryHandler(buttons)
+    )
+
+    print("Lucky Sticker запущен!")
+
+    application.run_polling()
 
 
 if __name__ == "__main__":
-    if not TOKEN or not URL:
-        raise RuntimeError(
-            "Проверь BOT_TOKEN и RENDER_EXTERNAL_URL"
-        )
-
-    threading.Thread(target=run_bot, daemon=True).start()
-
-    if not ready.wait(timeout=30):
-        raise RuntimeError("Bot startup timeout")
-
-    serve(app, host="0.0.0.0", port=PORT)
-
+    main()
